@@ -56,6 +56,29 @@ Once all replicas are ready, the client can be launched as follows:
 
 If `<increment>` equals 0 the request will be read-only. Default `<number of operations>` equals 1000.
 
+### Windows local run
+
+For a local Windows setup, you can build the distribution, copy the local test folders, and start the four replicas with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\runscripts\start-counter-demo.ps1
+```
+
+The script uses `gradlew.bat installDist localDeploy`, clears each replica's `config/currentView`, and prints the exact commands to run in four separate terminals.
+
+Once the replicas are ready, run a client from `build/local/cli0`:
+
+```powershell
+Set-Location .\build\local\cli0
+cmd /c smartrun.cmd bftsmart.demo.counter.CounterClient 1001 1 1
+```
+
+To stop replicas that are still listening on the demo ports:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\runscripts\stop-counter-demo.ps1
+```
+
 **Important tip #6:** Always make sure that each client uses a unique ID. Otherwise, clients may not be able to complete their operations.
 
 ## Read-only optimization
