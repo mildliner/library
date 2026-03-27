@@ -35,6 +35,10 @@ Type `./gradlew installDist` in the main directory. The required jar files and d
 Copy content of `build/install/library` into multiple folders for local testing or machines for distributed testing.
 
 ## Running the counter demonstration
+The counter demo implementation classes are:
+- `src/main/java/bftsmart/demo/counter/CounterServer.java`
+- `src/main/java/bftsmart/demo/counter/CounterClient.java`
+
 You can run the counter demonstration by executing the following commands, from within the folders containing compiled code across four different consoles (4 replicas, to tolerate 1 fault):
 
 ```
@@ -43,6 +47,15 @@ You can run the counter demonstration by executing the following commands, from 
 ./smartrun.sh bftsmart.demo.counter.CounterServer 2
 ./smartrun.sh bftsmart.demo.counter.CounterServer 3
 ```
+
+For single-machine runs, the expected sequence is:
+
+1. Build the distribution with `./gradlew installDist`.
+2. Change directory to `build/install/library`.
+3. If you changed `config/hosts.config` or replica-group parameters in `config/system.config`, remove `config/currentView` before starting replicas.
+4. Start replicas `0,1,2,3` (one process each).
+5. Wait until every replica prints `Ready to process operations`.
+6. Start one client (for example, process id `1001`).
 
 **Important tip #4:** If you are getting timeout messages, it is possible that the application you are running takes too long to process the requests or the network delay is too high and PROPOSE messages from the leader does not arrive in time, so replicas may start the leader change protocol. To prevent that, try to increase the `system.totalordermulticast.timeout` parameter in `config/system.config`.
 
@@ -55,6 +68,16 @@ Once all replicas are ready, the client can be launched as follows:
 ```
 
 If `<increment>` equals 0 the request will be read-only. Default `<number of operations>` equals 1000.
+
+For convenience, there is a helper script that automates local startup (build, currentView cleanup, replica startup, readiness checks, and one client run):
+
+```
+runscripts/run-counter-local.sh [<client id>] [<increment>] [<number of operations>]
+```
+
+If you already built `build/install/library`, you can skip rebuilding by setting `SKIP_BUILD=1`.
+
+For a concise single-machine checklist, see `docs/counter-single-machine-runbook.md`.
 
 **Important tip #6:** Always make sure that each client uses a unique ID. Otherwise, clients may not be able to complete their operations.
 
