@@ -1,144 +1,198 @@
 package bftsmart.demo.incident;
 
-import java.io.Serializable;
-import java.util.Locale;
+import java.io.ByteArrayOutputStream;
 import java.util.Map;
 import java.util.TreeMap;
 
-public class IncidentRecord implements Serializable {
+public final class IncidentRecord implements CanonicalWritable {
 
-    private static final long serialVersionUID = 1L;
-    private static final String UNSPECIFIED_HASH = "UNSPECIFIED";
-
-    private final String reportId;
-    private final String reporterId;
-    private final double latitude;
-    private final double longitude;
-    private final String description;
-    private final int validatorCount;
-    private final int faultTolerance;
-    private final int confirmationThreshold;
-    private final TreeMap<String, String> witnessEvidenceHashes;
+    private final IncidentPayload payload;
+    private final byte[] reportHash;
+    private final SubmitEnvelope submit;
+    private final TreeMap<String, ConfirmationRecord> confirmationsByShipId;
     private IncidentStatus status;
-    private String lastMutationHash;
+    private int validConfirmationCount;
+    private byte[] confirmationRoot;
+    private byte[] stateDigest;
+    private final long createdAtMs;
+    private long updatedAtMs;
 
-    public IncidentRecord(
-            String reportId,
-            String reporterId,
-            double latitude,
-            double longitude,
-            String description,
-            int validatorCount,
-            int faultTolerance,
-            String evidenceHash,
-            int confirmationThreshold) {
-        this.reportId = reportId;
-        this.reporterId = reporterId;
-        this.latitude = latitude;
-        this.longitude = longitude;
-        this.description = normalizeText(description);
-        this.validatorCount = validatorCount;
-        this.faultTolerance = faultTolerance;
-        this.confirmationThreshold = confirmationThreshold;
-        this.witnessEvidenceHashes = new TreeMap<String, String>();
+    public IncidentRecord(IncidentPayload payload, byte[] reportHash, SubmitEnvelope submit, long createdAtMs, long updatedAtMs) {
+        this.payload = payload;
+        this.reportHash = reportHash == null ? new byte[0] : reportHash.clone();
+        this.submit = submit;
+        this.confirmationsByShipId = new TreeMap<String, ConfirmationRecord>();
         this.status = IncidentStatus.PENDING;
-        this.lastMutationHash = "";
-        this.witnessEvidenceHashes.put(reporterId, normalizeHash(evidenceHash));
-        refreshStatus();
+        this.validConfirmationCount = 0;
+        this.confirmationRoot = CryptoUtils.zeroDigest();
+        this.stateDigest = CryptoUtils.zeroDigest();
+        this.createdAtMs = createdAtMs;
+        this.updatedAtMs = updatedAtMs;
+        refreshDerivedDigests();
     }
 
-    public boolean addConfirmation(String shipId, String evidenceHash) {
-        if (witnessEvidenceHashes.containsKey(shipId)) {
-            return false;
-        }
-        witnessEvidenceHashes.put(shipId, normalizeHash(evidenceHash));
-        refreshStatus();
-        return true;
+    private IncidentRecord(
+            IncidentPayload payload,
+            byte[] reportHash,
+            SubmitEnvelope submit,
+            TreeMap<String, ConfirmationRecord> confirmationsByShipId,
+            IncidentStatus status,
+            int validConfirmationCount,
+            byte[] confirmationRoot,
+            byte[] stateDigest,
+            long createdAtMs,
+            long updatedAtMs) {
+        this.payload = payload;
+        this.reportHash = reportHash == null ? new byte[0] : reportHash.clone();
+        this.submit = submit;
+        this.confirmationsByShipId = confirmationsByShipId;
+        this.status = status;
+        this.validConfirmationCount = validConfirmationCount;
+        this.confirmationRoot = confirmationRoot == null ? new byte[0] : confirmationRoot.clone();
+        this.stateDigest = stateDigest == null ? new byte[0] : stateDigest.clone();
+        this.createdAtMs = createdAtMs;
+        this.updatedAtMs = updatedAtMs;
+    }
+
+    public IncidentPayload getPayload() {
+        return payload;
     }
 
     public String getReportId() {
-        return reportId;
+        return payload.getReportId();
     }
 
-    public String getReporterId() {
-        return reporterId;
+    public String getReporterShipId() {
+        return payload.getReporterShipId();
     }
 
-    public double getLatitude() {
-        return latitude;
+    public byte[] getReportHash() {
+        return reportHash.clone();
     }
 
-    public double getLongitude() {
-        return longitude;
+    public SubmitEnvelope getSubmit() {
+        return submit;
     }
 
-    public String getDescription() {
-        return description;
+    public Map<String, ConfirmationRecord> getConfirmationsByShipId() {
+        return new TreeMap<String, ConfirmationRecord>(confirmationsByShipId);
     }
 
-    public int getConfirmationThreshold() {
-        return confirmationThreshold;
-    }
-
-    public int getValidatorCount() {
-        return validatorCount;
-    }
-
-    public int getFaultTolerance() {
-        return faultTolerance;
-    }
-
-    public int getConfirmationCount() {
-        return witnessEvidenceHashes.size();
-    }
-
-    public Map<String, String> getWitnessEvidenceHashes() {
-        return new TreeMap<String, String>(witnessEvidenceHashes);
+    public ConfirmationRecord getConfirmation(String shipId) {
+        return confirmationsByShipId.get(shipId);
     }
 
     public IncidentStatus getStatus() {
         return status;
     }
 
-    public String getLastMutationHash() {
-        return lastMutationHash;
+    public boolean isTerminal() {
+        return status == IncidentStatus.VERIFIED || status == IncidentStatus.EXPIRED;
     }
 
-    public void setLastMutationHash(String lastMutationHash) {
-        this.lastMutationHash = lastMutationHash;
+    public int getValidConfirmationCount() {
+        return validConfirmationCount;
     }
 
-    public String toDigestMaterial() {
-        StringBuilder builder = new StringBuilder();
-        builder.append("reportId=").append(reportId).append('\n');
-        builder.append("reporterId=").append(reporterId).append('\n');
-        builder.append("latitude=").append(formatCoordinate(latitude)).append('\n');
-        builder.append("longitude=").append(formatCoordinate(longitude)).append('\n');
-        builder.append("validatorCount=").append(validatorCount).append('\n');
-        builder.append("faultTolerance=").append(faultTolerance).append('\n');
-        builder.append("confirmationThreshold=").append(confirmationThreshold).append('\n');
-        builder.append("status=").append(status.name()).append('\n');
-        builder.append("description=").append(description.replace("\n", "\\n")).append('\n');
-        for (Map.Entry<String, String> entry : witnessEvidenceHashes.entrySet()) {
-            builder.append("witness=").append(entry.getKey()).append(':').append(entry.getValue()).append('\n');
+    public byte[] getConfirmationRoot() {
+        return confirmationRoot.clone();
+    }
+
+    public byte[] getStateDigest() {
+        return stateDigest.clone();
+    }
+
+    public long getCreatedAtMs() {
+        return createdAtMs;
+    }
+
+    public long getUpdatedAtMs() {
+        return updatedAtMs;
+    }
+
+    public long getExpiresAtMs() {
+        return submit.getExpiresAtMs();
+    }
+
+    public void addConfirmation(ConfirmationRecord confirmationRecord, long updatedAtMs) {
+        confirmationsByShipId.put(confirmationRecord.getConfirmerShipId(), confirmationRecord);
+        this.updatedAtMs = updatedAtMs;
+        refreshDerivedDigests();
+    }
+
+    public void setStatus(IncidentStatus status, long updatedAtMs) {
+        this.status = status;
+        this.updatedAtMs = updatedAtMs;
+        refreshDerivedDigests();
+    }
+
+    public void refreshDerivedDigests() {
+        validConfirmationCount = confirmationsByShipId.size();
+        confirmationRoot = MerkleTree.computeConfirmationRoot(confirmationsByShipId.values());
+        stateDigest = computeStateDigest(reportHash, submit, confirmationRoot, status, validConfirmationCount);
+    }
+
+    public static byte[] computeStateDigest(
+            byte[] reportHash,
+            SubmitEnvelope submit,
+            byte[] confirmationRoot,
+            IncidentStatus status,
+            int validConfirmationCount) {
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        output.write(0x20);
+        output.write(reportHash, 0, reportHash.length);
+        byte[] submitSignatureDigest = CryptoUtils.sha256(submit.getSignatureBytes());
+        output.write(submitSignatureDigest, 0, submitSignatureDigest.length);
+        output.write(confirmationRoot, 0, confirmationRoot.length);
+        writeInt(output, status.getCode());
+        writeInt(output, validConfirmationCount);
+        return CryptoUtils.sha256(output.toByteArray());
+    }
+
+    private static void writeInt(ByteArrayOutputStream output, int value) {
+        output.write((value >>> 24) & 0xff);
+        output.write((value >>> 16) & 0xff);
+        output.write((value >>> 8) & 0xff);
+        output.write(value & 0xff);
+    }
+
+    @Override
+    public void encode(CanonicalEncoder encoder) {
+        payload.encode(encoder);
+        encoder.writeByteArray(reportHash);
+        submit.encode(encoder);
+        encoder.writeInt(confirmationsByShipId.size());
+        for (ConfirmationRecord record : confirmationsByShipId.values()) {
+            record.encode(encoder);
         }
-        return builder.toString();
+        encoder.writeInt(status.getCode());
+        encoder.writeInt(validConfirmationCount);
+        encoder.writeByteArray(confirmationRoot);
+        encoder.writeByteArray(stateDigest);
+        encoder.writeLong(createdAtMs);
+        encoder.writeLong(updatedAtMs);
     }
 
-    private void refreshStatus() {
-        status = (getConfirmationCount() >= confirmationThreshold) ? IncidentStatus.VERIFIED : IncidentStatus.PENDING;
-    }
-
-    private static String normalizeText(String value) {
-        return value == null ? "" : value.trim();
-    }
-
-    private static String normalizeHash(String value) {
-        String normalized = normalizeText(value);
-        return normalized.isEmpty() ? UNSPECIFIED_HASH : normalized;
-    }
-
-    public static String formatCoordinate(double value) {
-        return String.format(Locale.ROOT, "%.6f", value);
+    public static IncidentRecord decode(CanonicalDecoder decoder) {
+        IncidentPayload payload = IncidentPayload.decode(decoder);
+        byte[] reportHash = decoder.readByteArray();
+        SubmitEnvelope submit = SubmitEnvelope.decode(decoder);
+        int count = decoder.readInt();
+        TreeMap<String, ConfirmationRecord> confirmations = new TreeMap<String, ConfirmationRecord>();
+        for (int i = 0; i < count; i++) {
+            ConfirmationRecord record = ConfirmationRecord.decode(decoder);
+            confirmations.put(record.getConfirmerShipId(), record);
+        }
+        return new IncidentRecord(
+                payload,
+                reportHash,
+                submit,
+                confirmations,
+                IncidentStatus.fromCode(decoder.readInt()),
+                decoder.readInt(),
+                decoder.readByteArray(),
+                decoder.readByteArray(),
+                decoder.readLong(),
+                decoder.readLong());
     }
 }

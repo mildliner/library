@@ -4,17 +4,8 @@ import bftsmart.tom.MessageContext;
 import bftsmart.tom.ServiceReplica;
 import bftsmart.tom.server.defaultservices.DefaultSingleRecoverable;
 
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
-import java.io.IOException;
-import java.io.ObjectInput;
-import java.io.ObjectInputStream;
-import java.io.ObjectOutput;
-import java.io.ObjectOutputStream;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.Map;
 import java.util.TreeMap;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -22,15 +13,22 @@ import java.util.logging.Logger;
 public final class IncidentServer extends DefaultSingleRecoverable {
 
     private static final Logger LOGGER = Logger.getLogger(IncidentServer.class.getName());
-    private static final String GENESIS_HASH = sha256("GENESIS");
+
+    private final ShipMembership membership;
+    private final long allowedClockSkewMs;
 
     private TreeMap<String, IncidentRecord> reports = new TreeMap<String, IncidentRecord>();
-    private long orderedRequests = 0L;
-    private long committedEntries = 0L;
-    private String ledgerHeadHash = GENESIS_HASH;
+    private TreeMap<String, Integer> requiredConfirmationsByReportId = new TreeMap<String, Integer>();
+    private TreeMap<String, IdempotencyRecord> processedRequests = new TreeMap<String, IdempotencyRecord>();
 
-    public IncidentServer(int id) {
-        new ServiceReplica(id, this, this);
+    public IncidentServer(int processId) {
+        this(processId, ShipMembership.defaultMembership(), IncidentProtocol.DEFAULT_ALLOWED_CLOCK_SKEW_MS);
+    }
+
+    IncidentServer(int processId, ShipMembership membership, long allowedClockSkewMs) {
+        this.membership = membership;
+        this.allowedClockSkewMs = allowedClockSkewMs;
+        new ServiceReplica(processId, this, this);
     }
 
     public static void main(String[] args) {
@@ -43,269 +41,412 @@ public final class IncidentServer extends DefaultSingleRecoverable {
 
     @Override
     public byte[] appExecuteOrdered(byte[] command, MessageContext msgCtx) {
-        orderedRequests++;
+        long referenceTimeMs = resolveReferenceTime(msgCtx);
         try {
-            IncidentRequest request = IncidentMessageIO.fromBytes(command, IncidentRequest.class);
-            IncidentResponse response;
-            switch (request.getType()) {
-                case SUBMIT_REPORT:
-                    response = handleSubmit(request);
-                    break;
-                case CONFIRM_REPORT:
-                    response = handleConfirm(request);
-                    break;
-                case GET_REPORT:
-                    response = handleGet(request);
-                    break;
-                case LIST_REPORTS:
-                    response = IncidentResponse.success(
-                            "Listed " + reports.size() + " incident report(s).",
-                            new ArrayList<IncidentRecord>(reports.values()),
-                            ledgerHeadHash);
-                    break;
-                case GET_LEDGER_HEAD:
-                    response = IncidentResponse.success("Current ledger head hash.", (IncidentRecord) null, ledgerHeadHash);
-                    break;
-                default:
-                    response = IncidentResponse.failure("Unsupported ordered request: " + request.getType(), ledgerHeadHash);
-                    break;
-            }
-            return IncidentMessageIO.toBytes(response);
-        } catch (IOException | ClassNotFoundException e) {
+            IncidentRequest request = IncidentRequest.fromBytes(command);
+            expirePendingReports(referenceTimeMs);
+            IncidentResponse response = handleOrdered(request, referenceTimeMs);
+            return response.toByteArray();
+        } catch (Exception e) {
             LOGGER.log(Level.SEVERE, "Failed to process ordered request", e);
-            return new byte[0];
+            return IncidentResponse.failure("Failed to process ordered request: " + e.getMessage(), computeLedgerHeadDigest())
+                    .toByteArray();
         }
     }
 
     @Override
     public byte[] appExecuteUnordered(byte[] command, MessageContext msgCtx) {
         try {
-            IncidentRequest request = IncidentMessageIO.fromBytes(command, IncidentRequest.class);
+            IncidentRequest request = IncidentRequest.fromBytes(command);
             IncidentResponse response;
             switch (request.getType()) {
                 case GET_REPORT:
-                    response = handleGet(request);
+                    response = handleGet(request.getReportId());
                     break;
                 case LIST_REPORTS:
                     response = IncidentResponse.success(
                             "Listed " + reports.size() + " incident report(s).",
                             new ArrayList<IncidentRecord>(reports.values()),
-                            ledgerHeadHash);
+                            computeLedgerHeadDigest());
                     break;
                 case GET_LEDGER_HEAD:
-                    response = IncidentResponse.success("Current ledger head hash.", (IncidentRecord) null, ledgerHeadHash);
+                    response = IncidentResponse.success("Current incident ledger head digest.", (IncidentRecord) null, computeLedgerHeadDigest());
                     break;
                 default:
-                    response = IncidentResponse.failure("Unsupported unordered request: " + request.getType(), ledgerHeadHash);
+                    response = IncidentResponse.failure("Unordered access is only allowed for get/list/head.", computeLedgerHeadDigest());
                     break;
             }
-            return IncidentMessageIO.toBytes(response);
-        } catch (IOException | ClassNotFoundException e) {
+            return response.toByteArray();
+        } catch (Exception e) {
             LOGGER.log(Level.SEVERE, "Failed to process unordered request", e);
-            return new byte[0];
+            return IncidentResponse.failure("Failed to process unordered request: " + e.getMessage(), computeLedgerHeadDigest())
+                    .toByteArray();
         }
     }
 
     @Override
     public void installSnapshot(byte[] state) {
-        try (ByteArrayInputStream byteIn = new ByteArrayInputStream(state);
-             ObjectInput objectIn = new ObjectInputStream(byteIn)) {
-            reports = castReports(objectIn.readObject());
-            orderedRequests = objectIn.readLong();
-            committedEntries = objectIn.readLong();
-            ledgerHeadHash = (String) objectIn.readObject();
-        } catch (IOException | ClassNotFoundException e) {
+        try {
+            CanonicalDecoder decoder = new CanonicalDecoder(state);
+            int schemaVersion = decoder.readInt();
+            if (schemaVersion != IncidentProtocol.SCHEMA_VERSION) {
+                throw new IllegalArgumentException("Unsupported snapshot schema version: " + schemaVersion);
+            }
+
+            TreeMap<String, IncidentRecord> nextReports = new TreeMap<String, IncidentRecord>();
+            TreeMap<String, Integer> nextRequired = new TreeMap<String, Integer>();
+            int reportCount = decoder.readInt();
+            for (int i = 0; i < reportCount; i++) {
+                IncidentRecord record = IncidentRecord.decode(decoder);
+                nextReports.put(record.getReportId(), record);
+                nextRequired.put(record.getReportId(), decoder.readInt());
+            }
+
+            TreeMap<String, IdempotencyRecord> nextIdempotency = new TreeMap<String, IdempotencyRecord>();
+            int idempotencyCount = decoder.readInt();
+            for (int i = 0; i < idempotencyCount; i++) {
+                IdempotencyRecord record = IdempotencyRecord.decode(decoder);
+                nextIdempotency.put(record.getRequestId(), record);
+            }
+            decoder.requireFullyRead();
+
+            reports = nextReports;
+            requiredConfirmationsByReportId = nextRequired;
+            processedRequests = nextIdempotency;
+        } catch (Exception e) {
             LOGGER.log(Level.SEVERE, "Error while installing snapshot", e);
         }
     }
 
     @Override
     public byte[] getSnapshot() {
-        try (ByteArrayOutputStream byteOut = new ByteArrayOutputStream();
-             ObjectOutput objectOut = new ObjectOutputStream(byteOut)) {
-            objectOut.writeObject(reports);
-            objectOut.writeLong(orderedRequests);
-            objectOut.writeLong(committedEntries);
-            objectOut.writeObject(ledgerHeadHash);
-            objectOut.flush();
-            return byteOut.toByteArray();
-        } catch (IOException e) {
+        try {
+            CanonicalEncoder encoder = new CanonicalEncoder();
+            encoder.writeInt(IncidentProtocol.SCHEMA_VERSION);
+            encoder.writeInt(reports.size());
+            for (Map.Entry<String, IncidentRecord> entry : reports.entrySet()) {
+                entry.getValue().encode(encoder);
+                Integer required = requiredConfirmationsByReportId.get(entry.getKey());
+                encoder.writeInt(required == null ? 0 : required.intValue());
+            }
+            encoder.writeInt(processedRequests.size());
+            for (IdempotencyRecord record : processedRequests.values()) {
+                record.encode(encoder);
+            }
+            return encoder.toByteArray();
+        } catch (Exception e) {
             LOGGER.log(Level.SEVERE, "Error while taking snapshot", e);
             return new byte[0];
         }
     }
 
-    private IncidentResponse handleSubmit(IncidentRequest request) {
-        String validationError = validateSubmit(request);
-        if (validationError != null) {
-            return IncidentResponse.failure(validationError, ledgerHeadHash);
+    private IncidentResponse handleOrdered(IncidentRequest request, long referenceTimeMs) {
+        switch (request.getType()) {
+            case SUBMIT:
+                return handleSubmit(request, referenceTimeMs);
+            case CONFIRM:
+                return handleConfirm(request, referenceTimeMs);
+            case GET_REPORT:
+                return handleGet(request.getReportId());
+            case LIST_REPORTS:
+                return IncidentResponse.success(
+                        "Listed " + reports.size() + " incident report(s).",
+                        new ArrayList<IncidentRecord>(reports.values()),
+                        computeLedgerHeadDigest());
+            case GET_LEDGER_HEAD:
+                return IncidentResponse.success("Current incident ledger head digest.", (IncidentRecord) null, computeLedgerHeadDigest());
+            default:
+                return IncidentResponse.failure("Unsupported request type: " + request.getType(), computeLedgerHeadDigest());
         }
-
-        if (reports.containsKey(request.getReportId())) {
-            IncidentRecord existing = reports.get(request.getReportId());
-            return IncidentResponse.failure(
-                    "Report " + request.getReportId() + " already exists.",
-                    existing,
-                    ledgerHeadHash);
-        }
-
-        IncidentRecord record = new IncidentRecord(
-                request.getReportId(),
-                request.getShipId(),
-                request.getLatitude(),
-                request.getLongitude(),
-                request.getDescription(),
-                resolveValidatorCount(request),
-                resolveFaultTolerance(request),
-                request.getEvidenceHash(),
-                resolveConfirmationThreshold(request));
-
-        String nextHash = appendLedgerEntry("SUBMIT_REPORT", record);
-        record.setLastMutationHash(nextHash);
-        reports.put(record.getReportId(), record);
-
-        LOGGER.info(String.format(
-                "Committed report %s from %s. confirmations=%d/%d status=%s",
-                record.getReportId(),
-                record.getReporterId(),
-                record.getConfirmationCount(),
-                record.getConfirmationThreshold(),
-                record.getStatus().name()));
-
-        return IncidentResponse.success(
-                "Report " + record.getReportId() + " registered.",
-                record,
-                ledgerHeadHash);
     }
 
-    private IncidentResponse handleConfirm(IncidentRequest request) {
-        String reportId = normalizeId(request.getReportId());
-        String shipId = normalizeId(request.getShipId());
-        if (reportId == null) {
-            return IncidentResponse.failure("reportId must not be blank.", ledgerHeadHash);
+    private IncidentResponse handleSubmit(IncidentRequest request, long referenceTimeMs) {
+        IncidentPayload payload = request.getPayload();
+        SubmitEnvelope submit = request.getSubmitEnvelope();
+        if (payload == null || submit == null) {
+            return failure("Submit requires both payload and submit envelope.", null);
         }
-        if (shipId == null) {
-            return IncidentResponse.failure("shipId must not be blank.", ledgerHeadHash);
+        if (request.getRequiredConfirmations() < 1) {
+            return failure("requiredConfirmations must be at least 1.", null);
+        }
+        if (payload.getSchemaVersion() != IncidentProtocol.SCHEMA_VERSION
+                || submit.getSchemaVersion() != IncidentProtocol.SCHEMA_VERSION
+                || request.getSchemaVersion() != IncidentProtocol.SCHEMA_VERSION) {
+            return failure("Unsupported schemaVersion.", null);
+        }
+        if (!IncidentProtocol.ACTION_SUBMIT.equals(submit.getAction())) {
+            return failure("Submit envelope action must be SUBMIT.", null);
+        }
+        if (!IncidentProtocol.SIGNATURE_ALGORITHM.equals(submit.getSignatureAlgorithm())) {
+            return failure("Submit envelope signature algorithm must be SHA256withECDSA.", null);
+        }
+        if (isBlank(payload.getReportId()) || isBlank(payload.getReporterShipId()) || isBlank(payload.getReporterKeyId())) {
+            return failure("reportId, reporterShipId, and reporterKeyId must not be blank.", null);
+        }
+        if (!payload.getReportId().equals(submit.getReportId()) || !payload.getReporterShipId().equals(submit.getReporterShipId())) {
+            return failure("Submit payload and envelope do not match reportId/reporterShipId.", null);
+        }
+        if (!membership.isMember(payload.getReporterShipId())) {
+            return failure("Reporter shipId is not a recognized member.", null);
+        }
+        if (!membership.shipOwnsKey(payload.getReporterShipId(), payload.getReporterKeyId())) {
+            return failure("reporterKeyId does not belong to reporterShipId.", null);
+        }
+        if (isBlank(submit.getRequestId())) {
+            return failure("Submit requestId must not be blank.", null);
+        }
+        String clockError = validateEnvelopeClock(submit.getIssuedAtMs(), submit.getExpiresAtMs(), referenceTimeMs);
+        if (clockError != null) {
+            return failure(clockError, null);
         }
 
-        IncidentRecord record = reports.get(reportId);
-        if (record == null) {
-            return IncidentResponse.failure("Report " + reportId + " does not exist.", ledgerHeadHash);
+        byte[] computedReportHash = payload.reportHash();
+        if (!CryptoUtils.equals(computedReportHash, submit.getReportHash())) {
+            return failure("reportHash does not match canonical IncidentPayload.", null);
         }
 
-        if (!record.addConfirmation(shipId, request.getEvidenceHash())) {
-            return IncidentResponse.success(
-                    "Ship " + shipId + " had already confirmed report " + reportId + ".",
-                    record,
-                    ledgerHeadHash);
+        ShipIdentity identity = membership.getByShipId(payload.getReporterShipId());
+        if (!CryptoUtils.verify(identity.getPublicKey(), submit.toBeSignedBytes(), submit.getSignatureBytes())) {
+            return failure("Submit signature mismatch.", null);
         }
 
-        String nextHash = appendLedgerEntry("CONFIRM_REPORT", record);
-        record.setLastMutationHash(nextHash);
-
-        LOGGER.info(String.format(
-                "Confirmed report %s by %s. confirmations=%d/%d status=%s",
-                record.getReportId(),
-                shipId,
-                record.getConfirmationCount(),
-                record.getConfirmationThreshold(),
-                record.getStatus().name()));
-
-        String message = "Confirmation from ship " + shipId + " recorded for report " + reportId + ".";
-        if (record.getStatus() == IncidentStatus.VERIFIED) {
-            message = "Report " + reportId + " reached the verification threshold.";
-        }
-        return IncidentResponse.success(message, record, ledgerHeadHash);
-    }
-
-    private IncidentResponse handleGet(IncidentRequest request) {
-        String reportId = normalizeId(request.getReportId());
-        if (reportId == null) {
-            return IncidentResponse.failure("reportId must not be blank.", ledgerHeadHash);
-        }
-        IncidentRecord record = reports.get(reportId);
-        if (record == null) {
-            return IncidentResponse.failure("Report " + reportId + " does not exist.", ledgerHeadHash);
-        }
-        return IncidentResponse.success("Fetched report " + reportId + ".", record, ledgerHeadHash);
-    }
-
-    private String appendLedgerEntry(String operation, IncidentRecord record) {
-        committedEntries++;
-        StringBuilder payload = new StringBuilder();
-        payload.append("entry=").append(committedEntries).append('\n');
-        payload.append("operation=").append(operation).append('\n');
-        payload.append("previous=").append(ledgerHeadHash).append('\n');
-        payload.append(record.toDigestMaterial());
-        ledgerHeadHash = sha256(payload.toString());
-        return ledgerHeadHash;
-    }
-
-    private static String validateSubmit(IncidentRequest request) {
-        if (normalizeId(request.getReportId()) == null) {
-            return "reportId must not be blank.";
-        }
-        if (normalizeId(request.getShipId()) == null) {
-            return "shipId must not be blank.";
-        }
-        if (request.getFaultTolerance() > 0) {
-            if (request.getFaultTolerance() < 1) {
-                return "faultTolerance must be at least 1.";
+        byte[] semanticDigest = buildSubmitSemanticDigest(payload, submit, request.getRequiredConfirmations());
+        IdempotencyRecord idempotencyRecord = processedRequests.get(submit.getRequestId());
+        if (idempotencyRecord != null) {
+            if (idempotencyRecord.getActionCode() != IncidentRequestType.SUBMIT.getCode()
+                    || !CryptoUtils.equals(idempotencyRecord.getSemanticDigest(), semanticDigest)) {
+                return failure("Submit requestId was already used for a different request.", null);
             }
-        } else if (request.getConfirmationThreshold() < 1) {
-            return "confirmationThreshold must be at least 1.";
+            IncidentRecord existing = reports.get(payload.getReportId());
+            if (existing != null) {
+                return success("Submit request was already processed.", existing);
+            }
         }
-        if (Double.isNaN(request.getLatitude()) || request.getLatitude() < -90.0d || request.getLatitude() > 90.0d) {
-            return "latitude must be between -90 and 90.";
+
+        IncidentRecord existing = reports.get(payload.getReportId());
+        if (existing != null) {
+            if (!CryptoUtils.equals(existing.getReportHash(), computedReportHash)) {
+                return failure("The same reportId cannot be reused with a different reportHash.", existing);
+            }
+            processedRequests.put(submit.getRequestId(), new IdempotencyRecord(
+                    submit.getRequestId(),
+                    IncidentRequestType.SUBMIT.getCode(),
+                    semanticDigest,
+                    payload.getReportId(),
+                    payload.getReporterShipId()));
+            return success("Report " + payload.getReportId() + " already exists with the same reportHash.", existing);
         }
-        if (Double.isNaN(request.getLongitude()) || request.getLongitude() < -180.0d || request.getLongitude() > 180.0d) {
-            return "longitude must be between -180 and 180.";
+
+        IncidentRecord record = new IncidentRecord(payload, computedReportHash, submit, referenceTimeMs, referenceTimeMs);
+        reports.put(payload.getReportId(), record);
+        requiredConfirmationsByReportId.put(payload.getReportId(), Integer.valueOf(request.getRequiredConfirmations()));
+        processedRequests.put(submit.getRequestId(), new IdempotencyRecord(
+                submit.getRequestId(),
+                IncidentRequestType.SUBMIT.getCode(),
+                semanticDigest,
+                payload.getReportId(),
+                payload.getReporterShipId()));
+
+        LOGGER.info(String.format(
+                "Committed SUBMIT for %s by %s, requiredConfirmations=%d, reportHash=%s",
+                payload.getReportId(),
+                payload.getReporterShipId(),
+                request.getRequiredConfirmations(),
+                HexUtils.toHex(record.getReportHash())));
+
+        return success(
+                "Report " + payload.getReportId() + " registered. Confirmations: 0/" + request.getRequiredConfirmations(),
+                record);
+    }
+
+    private IncidentResponse handleConfirm(IncidentRequest request, long referenceTimeMs) {
+        ConfirmEnvelope confirm = request.getConfirmEnvelope();
+        if (confirm == null) {
+            return failure("Confirm requires a confirm envelope.", null);
+        }
+        if (confirm.getSchemaVersion() != IncidentProtocol.SCHEMA_VERSION
+                || request.getSchemaVersion() != IncidentProtocol.SCHEMA_VERSION) {
+            return failure("Unsupported schemaVersion.", null);
+        }
+        if (!IncidentProtocol.ACTION_CONFIRM.equals(confirm.getAction())) {
+            return failure("Confirm envelope action must be CONFIRM.", null);
+        }
+        if (!IncidentProtocol.SIGNATURE_ALGORITHM.equals(confirm.getSignatureAlgorithm())) {
+            return failure("Confirm envelope signature algorithm must be SHA256withECDSA.", null);
+        }
+        if (isBlank(confirm.getReportId()) || isBlank(confirm.getConfirmerShipId()) || isBlank(confirm.getRequestId())) {
+            return failure("reportId, confirmerShipId, and requestId must not be blank.", null);
+        }
+        if (!membership.isMember(confirm.getConfirmerShipId())) {
+            return failure("Confirmer shipId is not a recognized member.", null);
+        }
+        String clockError = validateEnvelopeClock(confirm.getIssuedAtMs(), confirm.getExpiresAtMs(), referenceTimeMs);
+        if (clockError != null) {
+            return failure(clockError, null);
+        }
+
+        IncidentRecord record = reports.get(confirm.getReportId());
+        if (record == null) {
+            return failure("Report " + confirm.getReportId() + " does not exist.", null);
+        }
+        if (!CryptoUtils.equals(record.getReportHash(), confirm.getReportHash())) {
+            return failure("Confirm reportHash does not match the submitted reportHash.", record);
+        }
+        if (record.getStatus() == IncidentStatus.EXPIRED) {
+            return failure("Report " + confirm.getReportId() + " is already EXPIRED.", record);
+        }
+        if (record.getReporterShipId().equals(confirm.getConfirmerShipId())) {
+            return failure("The submitter does not count as a confirmer.", record);
+        }
+
+        ShipIdentity identity = membership.getByShipId(confirm.getConfirmerShipId());
+        if (!CryptoUtils.verify(identity.getPublicKey(), confirm.toBeSignedBytes(), confirm.getSignatureBytes())) {
+            return failure("Confirm signature mismatch.", record);
+        }
+
+        byte[] semanticDigest = buildConfirmSemanticDigest(confirm);
+        IdempotencyRecord idempotencyRecord = processedRequests.get(confirm.getRequestId());
+        if (idempotencyRecord != null) {
+            if (idempotencyRecord.getActionCode() != IncidentRequestType.CONFIRM.getCode()
+                    || !CryptoUtils.equals(idempotencyRecord.getSemanticDigest(), semanticDigest)) {
+                return failure("Confirm requestId was already used for a different request.", record);
+            }
+            return success("Confirm request was already processed.", record);
+        }
+
+        ConfirmationRecord existingConfirmation = record.getConfirmation(confirm.getConfirmerShipId());
+        byte[] confirmPayloadDigest = ConfirmationRecord.computePayloadDigest(confirm);
+        if (existingConfirmation != null) {
+            if (!CryptoUtils.equals(existingConfirmation.getConfirmPayloadDigest(), confirmPayloadDigest)) {
+                return failure("duplicate confirmerShipId with different confirm payload is not allowed.", record);
+            }
+            processedRequests.put(confirm.getRequestId(), new IdempotencyRecord(
+                    confirm.getRequestId(),
+                    IncidentRequestType.CONFIRM.getCode(),
+                    semanticDigest,
+                    confirm.getReportId(),
+                    confirm.getConfirmerShipId()));
+            return success("Ship " + confirm.getConfirmerShipId() + " had already confirmed report " + confirm.getReportId() + ".", record);
+        }
+
+        if (record.isTerminal()) {
+            return failure("Report " + confirm.getReportId() + " is already in a terminal state.", record);
+        }
+
+        ConfirmationRecord confirmationRecord = new ConfirmationRecord(confirm, confirmPayloadDigest, referenceTimeMs);
+        record.addConfirmation(confirmationRecord, referenceTimeMs);
+        int requiredConfirmations = resolveRequiredConfirmations(confirm.getReportId());
+        if (record.getValidConfirmationCount() >= requiredConfirmations) {
+            record.setStatus(IncidentStatus.VERIFIED, referenceTimeMs);
+        }
+
+        processedRequests.put(confirm.getRequestId(), new IdempotencyRecord(
+                confirm.getRequestId(),
+                IncidentRequestType.CONFIRM.getCode(),
+                semanticDigest,
+                confirm.getReportId(),
+                confirm.getConfirmerShipId()));
+
+        LOGGER.info(String.format(
+                "Committed CONFIRM for %s by %s, confirmations=%d/%d, confirmationRoot=%s, stateDigest=%s",
+                confirm.getReportId(),
+                confirm.getConfirmerShipId(),
+                record.getValidConfirmationCount(),
+                requiredConfirmations,
+                HexUtils.toHex(record.getConfirmationRoot()),
+                HexUtils.toHex(record.getStateDigest())));
+
+        if (record.getStatus() == IncidentStatus.VERIFIED) {
+            return success(
+                    "Report " + confirm.getReportId() + " reached VERIFIED at "
+                            + record.getValidConfirmationCount() + "/" + requiredConfirmations + ".",
+                    record);
+        }
+        return success(
+                "Confirmation from ship " + confirm.getConfirmerShipId() + " recorded for report "
+                        + confirm.getReportId() + ". Confirmations: "
+                        + record.getValidConfirmationCount() + "/" + requiredConfirmations,
+                record);
+    }
+
+    private IncidentResponse handleGet(String reportId) {
+        if (isBlank(reportId)) {
+            return failure("reportId must not be blank.", null);
+        }
+        IncidentRecord record = reports.get(reportId);
+        if (record == null) {
+            return failure("Report " + reportId + " does not exist.", null);
+        }
+        return success("Found report " + reportId + ".", record);
+    }
+
+    private void expirePendingReports(long referenceTimeMs) {
+        for (IncidentRecord record : reports.values()) {
+            if (record.getStatus() == IncidentStatus.PENDING && record.getExpiresAtMs() < referenceTimeMs) {
+                record.setStatus(IncidentStatus.EXPIRED, referenceTimeMs);
+            }
+        }
+    }
+
+    private int resolveRequiredConfirmations(String reportId) {
+        Integer value = requiredConfirmationsByReportId.get(reportId);
+        if (value == null || value.intValue() < 1) {
+            throw new IllegalStateException("Missing requiredConfirmations for reportId " + reportId);
+        }
+        return value.intValue();
+    }
+
+    private byte[] computeLedgerHeadDigest() {
+        CanonicalEncoder encoder = new CanonicalEncoder();
+        encoder.writeByte(0x21);
+        encoder.writeInt(reports.size());
+        for (Map.Entry<String, IncidentRecord> entry : reports.entrySet()) {
+            encoder.writeString(entry.getKey());
+            encoder.writeByteArray(entry.getValue().getStateDigest());
+            Integer required = requiredConfirmationsByReportId.get(entry.getKey());
+            encoder.writeInt(required == null ? 0 : required.intValue());
+        }
+        return CryptoUtils.sha256(encoder.toByteArray());
+    }
+
+    private byte[] buildSubmitSemanticDigest(IncidentPayload payload, SubmitEnvelope submit, int requiredConfirmations) {
+        CanonicalEncoder encoder = new CanonicalEncoder();
+        payload.encode(encoder);
+        encoder.writeByteArray(submit.toBeSignedBytes());
+        encoder.writeInt(requiredConfirmations);
+        return CryptoUtils.sha256(encoder.toByteArray());
+    }
+
+    private byte[] buildConfirmSemanticDigest(ConfirmEnvelope confirm) {
+        return CryptoUtils.sha256(confirm.toBeSignedBytes());
+    }
+
+    private String validateEnvelopeClock(long issuedAtMs, long expiresAtMs, long referenceTimeMs) {
+        if (expiresAtMs < issuedAtMs) {
+            return "Envelope expiresAtMs must be greater than or equal to issuedAtMs.";
+        }
+        if (expiresAtMs < referenceTimeMs) {
+            return "Envelope is already expired.";
+        }
+        if (issuedAtMs > referenceTimeMs + allowedClockSkewMs) {
+            return "Envelope issuedAtMs is too far in the future.";
         }
         return null;
     }
 
-    private static String normalizeId(String value) {
-        if (value == null) {
-            return null;
-        }
-        String trimmed = value.trim();
-        return trimmed.isEmpty() ? null : trimmed;
+    private IncidentResponse success(String message, IncidentRecord record) {
+        return IncidentResponse.success(message, record, computeLedgerHeadDigest());
     }
 
-    private static int resolveValidatorCount(IncidentRequest request) {
-        if (request.getFaultTolerance() > 0) {
-            return PbftMath.validatorCountForFaultTolerance(request.getFaultTolerance());
-        }
-        return request.getConfirmationThreshold();
+    private IncidentResponse failure(String message, IncidentRecord record) {
+        return IncidentResponse.failure(message, record, computeLedgerHeadDigest());
     }
 
-    private static int resolveFaultTolerance(IncidentRequest request) {
-        return request.getFaultTolerance();
+    private static long resolveReferenceTime(MessageContext msgCtx) {
+        return msgCtx == null ? System.currentTimeMillis() : msgCtx.getTimestamp();
     }
 
-    private static int resolveConfirmationThreshold(IncidentRequest request) {
-        if (request.getFaultTolerance() > 0) {
-            return PbftMath.quorumForFaultTolerance(request.getFaultTolerance());
-        }
-        return request.getConfirmationThreshold();
-    }
-
-    @SuppressWarnings("unchecked")
-    private static TreeMap<String, IncidentRecord> castReports(Object value) {
-        return (TreeMap<String, IncidentRecord>) value;
-    }
-
-    private static String sha256(String value) {
-        try {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            byte[] bytes = digest.digest(value.getBytes(StandardCharsets.UTF_8));
-            StringBuilder hex = new StringBuilder(bytes.length * 2);
-            for (byte current : bytes) {
-                hex.append(String.format("%02x", current & 0xff));
-            }
-            return hex.toString();
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException("SHA-256 is not available", e);
-        }
+    private static boolean isBlank(String value) {
+        return value == null || value.trim().isEmpty();
     }
 }

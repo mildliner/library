@@ -48,12 +48,12 @@ foreach ($id in 0..($ReplicaCount - 1)) {
 
 Write-Host ""
 Write-Host "Submit a sample incident after all replicas print 'Ready to process operations':"
-Write-Host ("  Set-Location `"{0}`"; cmd /c smartrun.cmd bftsmart.demo.incident.IncidentClient 1001 submit-pbft incident-001 ship-A 35.1000 129.0400 1 hash-ship-a Collision reported near Busan North Harbor" -f (Join-Path $localRoot "cli0"))
+Write-Host ("  Set-Location `"{0}`"; cmd /c smartrun.cmd bftsmart.demo.incident.IncidentClient 1001 submit incident-001 ship-A 35.1000 129.0400 101 5 2 Collision reported near Busan North Harbor" -f (Join-Path $localRoot "cli0"))
 
 Write-Host ""
 Write-Host "Confirm the incident from other ships:"
-Write-Host ("  Set-Location `"{0}`"; cmd /c smartrun.cmd bftsmart.demo.incident.IncidentClient 1002 confirm incident-001 ship-B hash-ship-b" -f (Join-Path $localRoot "cli0"))
-Write-Host ("  Set-Location `"{0}`"; cmd /c smartrun.cmd bftsmart.demo.incident.IncidentClient 1003 confirm incident-001 ship-C hash-ship-c" -f (Join-Path $localRoot "cli0"))
+Write-Host ("  Set-Location `"{0}`"; cmd /c smartrun.cmd bftsmart.demo.incident.IncidentClient 1002 confirm incident-001 ship-B 1 Witness report from ship B" -f (Join-Path $localRoot "cli0"))
+Write-Host ("  Set-Location `"{0}`"; cmd /c smartrun.cmd bftsmart.demo.incident.IncidentClient 1003 confirm incident-001 ship-C 1 Witness report from ship C" -f (Join-Path $localRoot "cli0"))
 
 Write-Host ""
 Write-Host "Inspect the replicated incident ledger:"

@@ -1,90 +1,129 @@
 package bftsmart.demo.incident;
 
-import java.io.Serializable;
+public final class IncidentRequest implements CanonicalWritable {
 
-public class IncidentRequest implements Serializable {
+    private final int schemaVersion;
+    private final IncidentRequestType type;
+    private final String reportId;
+    private final int requiredConfirmations;
+    private final IncidentPayload payload;
+    private final SubmitEnvelope submitEnvelope;
+    private final ConfirmEnvelope confirmEnvelope;
 
-    private static final long serialVersionUID = 1L;
+    private IncidentRequest(
+            int schemaVersion,
+            IncidentRequestType type,
+            String reportId,
+            int requiredConfirmations,
+            IncidentPayload payload,
+            SubmitEnvelope submitEnvelope,
+            ConfirmEnvelope confirmEnvelope) {
+        this.schemaVersion = schemaVersion;
+        this.type = type;
+        this.reportId = reportId == null ? "" : reportId;
+        this.requiredConfirmations = requiredConfirmations;
+        this.payload = payload;
+        this.submitEnvelope = submitEnvelope;
+        this.confirmEnvelope = confirmEnvelope;
+    }
 
-    private IncidentRequestType type;
-    private String reportId;
-    private String shipId;
-    private double latitude;
-    private double longitude;
-    private String description;
-    private String evidenceHash;
-    private int confirmationThreshold;
-    private int faultTolerance;
+    public static IncidentRequest submit(IncidentPayload payload, SubmitEnvelope submitEnvelope, int requiredConfirmations) {
+        return new IncidentRequest(
+                IncidentProtocol.SCHEMA_VERSION,
+                IncidentRequestType.SUBMIT,
+                payload.getReportId(),
+                requiredConfirmations,
+                payload,
+                submitEnvelope,
+                null);
+    }
+
+    public static IncidentRequest confirm(ConfirmEnvelope confirmEnvelope) {
+        return new IncidentRequest(
+                IncidentProtocol.SCHEMA_VERSION,
+                IncidentRequestType.CONFIRM,
+                confirmEnvelope.getReportId(),
+                0,
+                null,
+                null,
+                confirmEnvelope);
+    }
+
+    public static IncidentRequest get(String reportId) {
+        return new IncidentRequest(IncidentProtocol.SCHEMA_VERSION, IncidentRequestType.GET_REPORT, reportId, 0, null, null, null);
+    }
+
+    public static IncidentRequest list() {
+        return new IncidentRequest(IncidentProtocol.SCHEMA_VERSION, IncidentRequestType.LIST_REPORTS, "", 0, null, null, null);
+    }
+
+    public static IncidentRequest head() {
+        return new IncidentRequest(IncidentProtocol.SCHEMA_VERSION, IncidentRequestType.GET_LEDGER_HEAD, "", 0, null, null, null);
+    }
+
+    public int getSchemaVersion() {
+        return schemaVersion;
+    }
 
     public IncidentRequestType getType() {
         return type;
-    }
-
-    public void setType(IncidentRequestType type) {
-        this.type = type;
     }
 
     public String getReportId() {
         return reportId;
     }
 
-    public void setReportId(String reportId) {
-        this.reportId = reportId;
+    public int getRequiredConfirmations() {
+        return requiredConfirmations;
     }
 
-    public String getShipId() {
-        return shipId;
+    public IncidentPayload getPayload() {
+        return payload;
     }
 
-    public void setShipId(String shipId) {
-        this.shipId = shipId;
+    public SubmitEnvelope getSubmitEnvelope() {
+        return submitEnvelope;
     }
 
-    public double getLatitude() {
-        return latitude;
+    public ConfirmEnvelope getConfirmEnvelope() {
+        return confirmEnvelope;
     }
 
-    public void setLatitude(double latitude) {
-        this.latitude = latitude;
+    public byte[] toByteArray() {
+        return CanonicalEncoder.encode(this);
     }
 
-    public double getLongitude() {
-        return longitude;
+    @Override
+    public void encode(CanonicalEncoder encoder) {
+        encoder.writeInt(schemaVersion);
+        encoder.writeInt(type.getCode());
+        encoder.writeString(reportId);
+        encoder.writeInt(requiredConfirmations);
+        encoder.writeByte(payload == null ? 0 : 1);
+        if (payload != null) {
+            payload.encode(encoder);
+        }
+        encoder.writeByte(submitEnvelope == null ? 0 : 1);
+        if (submitEnvelope != null) {
+            submitEnvelope.encode(encoder);
+        }
+        encoder.writeByte(confirmEnvelope == null ? 0 : 1);
+        if (confirmEnvelope != null) {
+            confirmEnvelope.encode(encoder);
+        }
     }
 
-    public void setLongitude(double longitude) {
-        this.longitude = longitude;
-    }
-
-    public String getDescription() {
-        return description;
-    }
-
-    public void setDescription(String description) {
-        this.description = description;
-    }
-
-    public String getEvidenceHash() {
-        return evidenceHash;
-    }
-
-    public void setEvidenceHash(String evidenceHash) {
-        this.evidenceHash = evidenceHash;
-    }
-
-    public int getConfirmationThreshold() {
-        return confirmationThreshold;
-    }
-
-    public void setConfirmationThreshold(int confirmationThreshold) {
-        this.confirmationThreshold = confirmationThreshold;
-    }
-
-    public int getFaultTolerance() {
-        return faultTolerance;
-    }
-
-    public void setFaultTolerance(int faultTolerance) {
-        this.faultTolerance = faultTolerance;
+    public static IncidentRequest fromBytes(byte[] input) {
+        CanonicalDecoder decoder = new CanonicalDecoder(input);
+        IncidentRequest request = new IncidentRequest(
+                decoder.readInt(),
+                IncidentRequestType.fromCode(decoder.readInt()),
+                decoder.readString(),
+                decoder.readInt(),
+                decoder.readByte() == 1 ? IncidentPayload.decode(decoder) : null,
+                decoder.readByte() == 1 ? SubmitEnvelope.decode(decoder) : null,
+                decoder.readByte() == 1 ? ConfirmEnvelope.decode(decoder) : null);
+        decoder.requireFullyRead();
+        return request;
     }
 }
